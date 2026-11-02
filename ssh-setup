@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+# Print the command-line help text in one place so it can be shown for both
+# explicit help requests and invalid invocations.
 usage() {
     cat <<'EOF'
 ssh-setup creates an SSH key and installs it on a remote account so you can
@@ -25,9 +27,15 @@ Options:
 EOF
 }
 
+# Start with the default key location and replace it only when the caller
+# supplies a custom path. The target remains empty until argument parsing
+# identifies the single remote account to configure.
 key_path="${HOME}/.ssh/id_ed25519"
 target=""
 
+# Parse options and positional arguments without allowing an ambiguous target.
+# Invalid or incomplete input exits before any local files or remote accounts
+# are changed.
 while (($# > 0)); do
     case "$1" in
         --key)
@@ -59,17 +67,25 @@ while (($# > 0)); do
     esac
 done
 
+# A target is required because every subsequent operation depends on the
+# remote USER@HOST destination.
 if [[ -z "$target" ]]; then
     printf 'ssh-setup: a USER@HOST target is required\n' >&2
     usage >&2
     exit 2
 fi
 
+# Prepare the key directory with restrictive permissions before creating or
+# using key material. The public-key path is derived from the selected private
+# key path so both files stay paired.
 public_key="${key_path}.pub"
 key_directory=$(dirname "$key_path")
 mkdir -p "$key_directory"
 chmod 700 "$key_directory"
 
+# Reject special files at the private-key path. When no private key exists,
+# create a new Ed25519 pair; when the private key does exist, require its
+# matching public key so the exact key being installed can be verified.
 if [[ -e "$key_path" && ! -f "$key_path" ]]; then
     printf 'ssh-setup: key path is not a regular file: %s\n' "$key_path" >&2
     exit 1
@@ -88,6 +104,9 @@ fi
 chmod 600 "$key_path"
 chmod 644 "$public_key"
 
+# Send the public key over the first SSH connection. The remote shell creates
+# the SSH configuration directory and authorized-keys file, then adds the key
+# only when it is not already present.
 printf 'Installing %s on %s (the remote password may be requested once)...\n' \
     "$public_key" "$target"
 ssh -i "$key_path" "$target" \
@@ -105,6 +124,9 @@ ssh -i "$key_path" "$target" \
      chmod 700 "$HOME/.ssh"
      chmod 600 "$HOME/.ssh/authorized_keys"' < "$public_key"
 
+# Confirm that the remote account accepts the selected private key without
+# falling back to a password. Report installation success separately from
+# verification failure so callers can distinguish the two outcomes.
 printf 'Done. Testing key-based login...\n'
 if ssh -o BatchMode=yes -o PasswordAuthentication=no -i "$key_path" "$target" true; then
     printf 'Passwordless SSH login is ready for %s.\n' "$target"
