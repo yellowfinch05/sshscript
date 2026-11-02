@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ssh-setup [--key PATH] [--help] USER@HOST
+
+Create an unencrypted Ed25519 key if needed and install its public key on the
+remote host. The initial ssh connection may ask for the remote user's password.
+EOF
+}
+
+key_path="${HOME}/.ssh/id_ed25519"
+target=""
+
+while (($# > 0)); do
+    case "$1" in
+        --key)
+            if (($# < 2)); then
+                printf 'ssh-setup: --key requires a path\n' >&2
+                exit 2
+            fi
+            key_path=$2
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        -*)
+            printf 'ssh-setup: unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            if [[ -n "$target" ]]; then
+                printf 'ssh-setup: only one USER@HOST target is allowed\n' >&2
+                usage >&2
+                exit 2
+            fi
+            target=$1
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$target" ]]; then
+    printf 'ssh-setup: a USER@HOST target is required\n' >&2
+    usage >&2
+    exit 2
+fi
+
+public_key="${key_path}.pub"
+key_directory=$(dirname "$key_path")
+mkdir -p "$key_directory"
+chmod 700 "$key_directory"
+
+if [[ -e "$key_path" && ! -f "$key_path" ]]; then
+    printf 'ssh-setup: key path is not a regular file: %s\n' "$key_path" >&2
+    exit 1
+fi
+
+if [[ ! -e "$key_path" ]]; then
+    printf 'Creating an Ed25519 key at %s\n' "$key_path"
+    ssh-keygen -q -t ed25519 -f "$key_path" -N "" -C "${USER:-sshscript}@$(hostname)"
+elif [[ ! -f "$public_key" ]]; then
+    printf 'ssh-setup: public key is missing: %s\n' "$public_key" >&2
+    printf 'Generate a matching public key with: ssh-keygen -y -f %q > %q\n' \
+        "$key_path" "$public_key" >&2
+    exit 1
+fi
+
+chmod 600 "$key_path"
+chmod 644 "$public_key"
+
+printf 'Installing %s on %s (the remote password may be requested once)...\n' \
+    "$public_key" "$target"
+ssh -i "$key_path" "$target" \
+    'umask 077
+     mkdir -p "$HOME/.ssh"
+     touch "$HOME/.ssh/authorized_keys"
+     key=$(cat)
+     if [ -z "$key" ]; then
+         printf "ssh-setup: public key input was empty\n" >&2
+         exit 1
+     fi
+     if ! grep -Fqx -- "$key" "$HOME/.ssh/authorized_keys"; then
+         printf "%s\n" "$key" >> "$HOME/.ssh/authorized_keys"
+     fi
+     chmod 700 "$HOME/.ssh"
+     chmod 600 "$HOME/.ssh/authorized_keys"' < "$public_key"
+
+printf 'Done. Testing key-based login...\n'
+if ssh -o BatchMode=yes -o PasswordAuthentication=no -i "$key_path" "$target" true; then
+    printf 'Passwordless SSH login is ready for %s.\n' "$target"
+else
+    printf 'ssh-setup: key installation completed, but key-only login failed\n' >&2
+    exit 1
+fi
