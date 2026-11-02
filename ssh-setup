@@ -4,10 +4,24 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ssh-setup [--key PATH] [--help] USER@HOST
+ssh-setup creates an SSH key and installs it on a remote account so you can
+connect without entering the account password on future SSH connections.
 
-Create an unencrypted Ed25519 key if needed and install its public key on the
-remote host. The initial ssh connection may ask for the remote user's password.
+Usage:
+  ssh-setup [--key PATH] USER@HOST
+  ssh-setup --help
+
+Examples:
+  ssh-setup alice@example.com
+  ssh-setup --key ~/.ssh/work_ed25519 alice@example.com
+
+The first connection may ask for the remote account's password. This is needed
+to install the public key. The script creates an Ed25519 key at
+~/.ssh/id_ed25519 if one does not already exist, then verifies key-only login.
+
+Options:
+  --key PATH  Use PATH instead of ~/.ssh/id_ed25519.
+  -h, --help  Show this help message.
 EOF
 }
 
