@@ -23,5 +23,15 @@ key location:
 ./ssh-setup --key ~/.ssh/work_ed25519 user@example.com
 ```
 
+To remove that key from the remote account's `authorized_keys` file without
+deleting the local key files:
+
+```sh
+./ssh-setup --remove-key --key ~/.ssh/work_ed25519 user@example.com
+```
+
+Without `--key`, removal looks for `~/.ssh/id_ed25519`. If that key pair is
+not found, the script asks for the private-key path to use instead.
+
 The script requires Bash, OpenSSH (`ssh` and `ssh-keygen`), and an account that
 can initially authenticate to the remote host.

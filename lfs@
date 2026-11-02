@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Print the command-line help text in one place so it can be shown for both
+# explicit help requests and invalid invocations.
+usage() {
+    cat <<'EOF'
+ssh-setup creates an SSH key and installs it on a remote account so you can
+connect without entering the account password on future SSH connections.
+
+Usage:
+  ssh-setup [--key PATH] USER@HOST
+  ssh-setup --remove-key [--key PATH] USER@HOST
+  ssh-setup --help
+
+Examples:
+  ssh-setup alice@example.com
+  ssh-setup --key ~/.ssh/work_ed25519 alice@example.com
+
+The first connection may ask for the remote account's password. This is needed
+to install the public key. The script creates an Ed25519 key at
+~/.ssh/id_ed25519 if one does not already exist, then verifies key-only login.
+
+Options:
+  --key PATH  Use PATH instead of ~/.ssh/id_ed25519.
+  --remove-key  Remove the selected public key from the remote account.
+  -h, --help  Show this help message.
+EOF
+}
+
+# Start with the default key location and replace it only when the caller
+# supplies a custom path. The target remains empty until argument parsing
+# identifies the single remote account to configure.
+key_path="${HOME}/.ssh/id_ed25519"
+target=""
+remove_key=false
+
+# Parse options and positional arguments without allowing an ambiguous target.
+# Invalid or incomplete input exits before any local files or remote accounts
+# are changed.
+while (($# > 0)); do
+    case "$1" in
+        --key)
+            if (($# < 2)); then
+                printf 'ssh-setup: --key requires a path\n' >&2
+                exit 2
+            fi
+            key_path=$2
+            shift 2
+            ;;
+        --remove-key)
+            remove_key=true
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        -*)
+            printf 'ssh-setup: unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            if [[ -n "$target" ]]; then
+                printf 'ssh-setup: only one USER@HOST target is allowed\n' >&2
+                usage >&2
+                exit 2
+            fi
+            target=$1
+            shift
+            ;;
+    esac
+done
+
+# A target is required because every subsequent operation depends on the
+# remote USER@HOST destination.
+if [[ -z "$target" ]]; then
+    printf 'ssh-setup: a USER@HOST target is required\n' >&2
+    usage >&2
+    exit 2
+fi
+
+# Removal uses the existing private key to authenticate, so it must never
+# create a new key as a side effect.
+if "$remove_key"; then
+    # Prefer the default key pair created by ssh-setup. If it is unavailable,
+    # ask for another private-key path rather than creating or deleting files.
+    public_key="${key_path}.pub"
+    if [[ ! -f "$key_path" || ! -f "$public_key" ]]; then
+        printf 'ssh-setup: key pair was not found at %s\n' "$key_path" >&2
+        printf 'Enter the path to the private key to remove: '
+        if ! read -r key_path; then
+            printf '\nssh-setup: a private key path is required\n' >&2
+            exit 1
+        fi
+        if [[ "$key_path" == '~/'* ]]; then
+            key_path="${HOME}/${key_path#~/}"
+        fi
+        public_key="${key_path}.pub"
+    fi
+    if [[ ! -f "$key_path" ]]; then
+        printf 'ssh-setup: private key is missing: %s\n' "$key_path" >&2
+        exit 1
+    fi
+    if [[ ! -f "$public_key" ]]; then
+        printf 'ssh-setup: public key is missing: %s\n' "$public_key" >&2
+        exit 1
+    fi
+    if [[ ! -s "$public_key" ]]; then
+        printf 'ssh-setup: public key is empty: %s\n' "$public_key" >&2
+        exit 1
+    fi
+
+    # Send the selected public key to the remote account and remove only exact
+    # matching lines, preserving every other authorized key.
+    printf 'Removing %s from %s...\n' "$public_key" "$target"
+    ssh -i "$key_path" "$target" \
+        'key=$(cat)
+         authorized_keys="$HOME/.ssh/authorized_keys"
+         if [ ! -f "$authorized_keys" ]; then
+             exit 0
+         fi
+         tmp="${authorized_keys}.tmp.$$"
+         if grep -Fvx -- "$key" "$authorized_keys" > "$tmp"; then
+             :
+         else
+             status=$?
+             if [ "$status" -ne 1 ]; then
+                 rm -f "$tmp"
+                 exit "$status"
+             fi
+         fi
+         chmod 600 "$tmp"
+         mv "$tmp" "$authorized_keys"' < "$public_key"
+    printf 'Removed the selected key from %s. Local key files were kept.\n' "$target"
+    exit 0
+fi
+
+# Prepare the key directory with restrictive permissions before creating or
+# using key material. The public-key path is derived from the selected private
+# key path so both files stay paired.
+public_key="${key_path}.pub"
+key_directory=$(dirname "$key_path")
+mkdir -p "$key_directory"
+chmod 700 "$key_directory"
+
+# Reject special files at the private-key path. When no private key exists,
+# create a new Ed25519 pair; when the private key does exist, require its
+# matching public key so the exact key being installed can be verified.
+if [[ -e "$key_path" && ! -f "$key_path" ]]; then
+    printf 'ssh-setup: key path is not a regular file: %s\n' "$key_path" >&2
+    exit 1
+fi
+
+if [[ ! -e "$key_path" ]]; then
+    printf 'Creating an Ed25519 key at %s\n' "$key_path"
+    ssh-keygen -q -t ed25519 -f "$key_path" -N "" -C "${USER:-sshscript}@$(hostname)"
+elif [[ ! -f "$public_key" ]]; then
+    printf 'ssh-setup: public key is missing: %s\n' "$public_key" >&2
+    printf 'Generate a matching public key with: ssh-keygen -y -f %q > %q\n' \
+        "$key_path" "$public_key" >&2
+    exit 1
+fi
+
+chmod 600 "$key_path"
+chmod 644 "$public_key"
+
+# Send the public key over the first SSH connection. The remote shell creates
+# the SSH configuration directory and authorized-keys file, then adds the key
+# only when it is not already present.
+printf 'Installing %s on %s (the remote password may be requested once)...\n' \
+    "$public_key" "$target"
+ssh -i "$key_path" "$target" \
+    'umask 077
+     mkdir -p "$HOME/.ssh"
+     touch "$HOME/.ssh/authorized_keys"
+     key=$(cat)
+     if [ -z "$key" ]; then
+         printf "ssh-setup: public key input was empty\n" >&2
+         exit 1
+     fi
+     if ! grep -Fqx -- "$key" "$HOME/.ssh/authorized_keys"; then
+         printf "%s\n" "$key" >> "$HOME/.ssh/authorized_keys"
+     fi
+     chmod 700 "$HOME/.ssh"
+     chmod 600 "$HOME/.ssh/authorized_keys"' < "$public_key"
+
+# Confirm that the remote account accepts the selected private key without
+# falling back to a password. Report installation success separately from
+# verification failure so callers can distinguish the two outcomes.
+printf 'Done. Testing key-based login...\n'
+if ssh -o BatchMode=yes -o PasswordAuthentication=no -i "$key_path" "$target" true; then
+    printf 'Passwordless SSH login is ready for %s.\n' "$target"
+else
+    printf 'ssh-setup: key installation completed, but key-only login failed\n' >&2
+    exit 1
+fi
